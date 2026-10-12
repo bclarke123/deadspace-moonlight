@@ -11,6 +11,8 @@
  * vendor ID, reports the DeviceID of a real GPU in the system instead. All
  * Direct3D 9 calls are passed through to the system d3d9.dll, and frames are
  * capped at 60 fps because the game's physics break at higher frame rates.
+ * The mouse wheel is also counted independently of DirectInput (whose wheel
+ * value can get stuck, scrolling menus forever) and rate-limited.
  *
  * Constraints learned the hard way:
  *  - Windows applies its DXMaximizedWindowedMode compatibility shim
@@ -25,7 +27,9 @@
  *
  * Logging: create an empty "d3d9shim.log" next to this DLL to enable it.
  */
+#define DIRECTINPUT_VERSION 0x0800
 #include <windows.h>
+#include <dinput.h>
 #include <string.h>
 
 #define ARRAYSIZE_(a) (sizeof(a) / sizeof((a)[0]))
@@ -38,6 +42,8 @@ static BOOL g_logEnabled;
 static char g_gpuId[128];
 static EnumDisplayDevicesW_t g_enumW;
 static unsigned __int64 g_loggedAdapters;
+
+static void InstallWheelFix(void);
 
 /* ------------------------------------------------------------------------ */
 /* Logging                                                                   */
@@ -409,12 +415,271 @@ void *WINAPI My_Direct3DCreate9(UINT sdkVersion)
             if (!g_timer) /* High-resolution timers need Windows 10 1803+. */
                 g_timer = CreateWaitableTimerW(NULL, FALSE, NULL);
             QueryPerformanceCounter(&g_fpsWindowStart);
+            InstallWheelFix();
         }
         PatchVtable(*(void ***)d3d, VT_D3D9_CREATEDEVICE, (void *)Hook_CreateDevice, (void **)&g_realCreateDevice);
     }
     return d3d;
 }
 #pragma comment(linker, "/export:Direct3DCreate9=_My_Direct3DCreate9@4,@37")
+
+/* ------------------------------------------------------------------------ */
+/* Mouse wheel fix                                                           */
+/*                                                                           */
+/* The game reads the wheel through DirectInput as movement since the last   */
+/* read. On some setups (seen with input injected by Sunshine/Moonlight)     */
+/* DirectInput's wheel value never resets to zero, so the game sees endless  */
+/* scrolling and menus skip forever. Fast wheels (free-spinning Logitech MX) */
+/* and high-resolution scrolling also flood the menus.                       */
+/*                                                                           */
+/* So we ignore DirectInput's wheel value and count wheel events ourselves   */
+/* with a low-level mouse hook, then hand the game whole clicks, at most one */
+/* per WHEEL_MIN_INTERVAL_MS, dropping the excess so movement stops when the */
+/* wheel stops.                                                              */
+
+/* vtable slots, from dinput.h */
+#define VT_DIDEV_GETCAPABILITIES 3
+#define VT_DIDEV_GETPROPERTY     5
+#define VT_DIDEV_GETDEVICESTATE  9
+#define VT_DIDEV_GETDEVICEDATA   10
+
+/* At most one wheel click per this many ms reaches the game. */
+#define WHEEL_MIN_INTERVAL_MS 100
+/* A partial click older than this is dropped instead of carried over. */
+#define WHEEL_IDLE_RESET_MS 300
+
+typedef HRESULT (WINAPI *DirectInput8Create_t)(HINSTANCE, DWORD, REFIID, void **, void *);
+typedef HRESULT (WINAPI *GetCapabilities_t)(void *, DIDEVCAPS *);
+typedef HRESULT (WINAPI *GetProperty_t)(void *, REFGUID, DIPROPHEADER *);
+typedef HRESULT (WINAPI *GetDeviceState_t)(void *, DWORD, void *);
+typedef HRESULT (WINAPI *GetDeviceData_t)(void *, DWORD, DIDEVICEOBJECTDATA *, DWORD *, DWORD);
+
+static GetDeviceState_t g_realGetDeviceState;
+static GetDeviceData_t g_realGetDeviceData;
+
+/* Wheel movement counted by the mouse hook and not yet read by the game. */
+static volatile LONG g_wheelCounted;
+static BOOL g_wheelHooked;
+
+/* The device vtable is shared by mice and keyboards, so remember which device
+ * objects are mice, and how each one reports its wheel. */
+typedef struct {
+    void *device;
+    LONG click;      /* wheel units per click, 0 = not a mouse */
+    BOOL absolute;   /* game asked for the wheel as a position, not a delta */
+    LONG gamePos;    /* absolute mode: position we report to the game */
+    LONG pending;    /* movement not yet passed on */
+    DWORD lastMove;  /* GetTickCount of the last wheel movement */
+    DWORD lastEmit;  /* GetTickCount of the last click passed on */
+    LONG lastDiRaw;  /* DirectInput's own wheel value, for the log */
+} WheelState;
+
+static WheelState g_wheels[8];
+static int g_wheelLogLines;
+
+static BOOL GetDwordProperty(void *device, REFGUID prop, DWORD obj, DWORD how, DWORD *value)
+{
+    DIPROPDWORD p;
+    ZeroMemory(&p, sizeof(p));
+    p.diph.dwSize = sizeof(p);
+    p.diph.dwHeaderSize = sizeof(p.diph);
+    p.diph.dwObj = obj;
+    p.diph.dwHow = how;
+    if (FAILED(((GetProperty_t)(*(void ***)device)[VT_DIDEV_GETPROPERTY])(device, prop, &p.diph)))
+        return FALSE;
+    *value = p.dwData;
+    return TRUE;
+}
+
+static WheelState *WheelFor(void *device)
+{
+    DIDEVCAPS caps;
+    DWORD value;
+    WheelState *w;
+    int i;
+
+    for (i = 0; i < (int)ARRAYSIZE_(g_wheels); i++) {
+        if (g_wheels[i].device == device)
+            return g_wheels[i].click ? &g_wheels[i] : NULL;
+    }
+    for (i = 0; i < (int)ARRAYSIZE_(g_wheels) && g_wheels[i].device; i++)
+        ;
+    if (i == (int)ARRAYSIZE_(g_wheels))
+        return NULL;
+    w = &g_wheels[i];
+    w->device = device;
+
+    ZeroMemory(&caps, sizeof(caps));
+    caps.dwSize = sizeof(caps);
+    if (FAILED(((GetCapabilities_t)(*(void ***)device)[VT_DIDEV_GETCAPABILITIES])(device, &caps)) ||
+        GET_DIDEVICE_TYPE(caps.dwDevType) != DI8DEVTYPE_MOUSE)
+        return NULL;
+
+    /* Wheel units per click: usually WHEEL_DELTA (120). */
+    if (GetDwordProperty(device, DIPROP_GRANULARITY, DIMOFS_Z, DIPH_BYOFFSET, &value) && value > 1 && value <= 10000)
+        w->click = (LONG)value;
+    else
+        w->click = WHEEL_DELTA;
+    w->absolute = GetDwordProperty(device, DIPROP_AXISMODE, 0, DIPH_DEVICE, &value) && value == DIPROPAXISMODE_ABS;
+    Log("mouse device found, wheel click = %ld, %s axes", w->click, w->absolute ? "absolute" : "relative");
+    return w;
+}
+
+/* Take the wheel movement counted since the last read and return the movement
+ * to pass on: zero or one whole click. */
+static LONG FilterWheel(WheelState *w, LONG diRaw, const char *source)
+{
+    LONG delta = InterlockedExchange(&g_wheelCounted, 0);
+    DWORD now = GetTickCount();
+    LONG out = 0;
+
+    if (delta != 0) {
+        /* Drop a stale partial click, or movement left over from the other direction. */
+        if (now - w->lastMove > WHEEL_IDLE_RESET_MS || (w->pending > 0) != (delta > 0))
+            w->pending = 0;
+        w->lastMove = now;
+        w->pending += delta;
+    }
+    if ((w->pending >= w->click || w->pending <= -w->click) && now - w->lastEmit >= WHEEL_MIN_INTERVAL_MS) {
+        out = w->pending > 0 ? w->click : -w->click;
+        w->lastEmit = now;
+        w->pending = 0; /* drop the excess so a fast spin doesn't keep scrolling */
+    }
+    /* Never bank more than one click while rate-limited. */
+    if (w->pending > w->click)
+        w->pending = w->click;
+    else if (w->pending < -w->click)
+        w->pending = -w->click;
+
+    if (g_logEnabled && (delta || out || diRaw != w->lastDiRaw) && g_wheelLogLines < 400) {
+        g_wheelLogLines++;
+        Log("wheel %s t=%lu counted=%ld out=%ld (directinput said %ld)", source, now, delta, out, diRaw);
+    }
+    w->lastDiRaw = diRaw;
+    return out;
+}
+
+static HRESULT WINAPI Hook_GetDeviceState(void *device, DWORD size, void *data)
+{
+    HRESULT hr = g_realGetDeviceState(device, size, data);
+    WheelState *w;
+
+    /* DIMOUSESTATE and DIMOUSESTATE2 both start lX, lY, lZ. */
+    if (g_wheelHooked && SUCCEEDED(hr) && data && size >= 3 * sizeof(LONG) && (w = WheelFor(device)) != NULL) {
+        LONG *z = &((LONG *)data)[2];
+        LONG out = FilterWheel(w, *z, "state");
+        if (w->absolute) {
+            w->gamePos += out;
+            *z = w->gamePos;
+        } else {
+            *z = out;
+        }
+    }
+    return hr;
+}
+
+static HRESULT WINAPI Hook_GetDeviceData(void *device, DWORD objSize, DIDEVICEOBJECTDATA *events,
+                                         DWORD *count, DWORD flags)
+{
+    HRESULT hr = g_realGetDeviceData(device, objSize, events, count, flags);
+    WheelState *w;
+    DWORD i, kept;
+    BYTE *base = (BYTE *)events;
+    BOOL delivered = FALSE;
+
+    /* Leave peeks and count-only calls alone. */
+    if (!g_wheelHooked || FAILED(hr) || !events || !count || (flags & DIGDD_PEEK) ||
+        objSize < sizeof(DIDEVICEOBJECTDATA_DX3) || (w = WheelFor(device)) == NULL)
+        return hr;
+
+    /* Replace DirectInput's wheel events: the first one carries our filtered
+     * click (if any), the rest are dropped. */
+    for (i = 0, kept = 0; i < *count; i++) {
+        DIDEVICEOBJECTDATA *e = (DIDEVICEOBJECTDATA *)(base + i * objSize);
+        if (e->dwOfs == (DWORD)DIMOFS_Z) {
+            LONG out = delivered ? 0 : FilterWheel(w, (LONG)e->dwData, "data");
+            delivered = TRUE;
+            if (out == 0)
+                continue;
+            w->gamePos += out;
+            e->dwData = (DWORD)(w->absolute ? w->gamePos : out);
+        }
+        if (kept != i)
+            memmove(base + kept * objSize, e, objSize);
+        kept++;
+    }
+    *count = kept;
+    return hr;
+}
+
+/* Low-level mouse hook: count wheel movement while the game is the active
+ * window. Runs on its own thread; must return quickly. */
+static LRESULT CALLBACK WheelHookProc(int code, WPARAM msg, LPARAM lparam)
+{
+    if (code == HC_ACTION && msg == WM_MOUSEWHEEL) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+        if (pid == GetCurrentProcessId())
+            InterlockedExchangeAdd(&g_wheelCounted, (SHORT)HIWORD(((MSLLHOOKSTRUCT *)lparam)->mouseData));
+    }
+    return CallNextHookEx(NULL, code, msg, lparam);
+}
+
+static DWORD WINAPI WheelHookThread(void *param)
+{
+    HANDLE ready = (HANDLE)param;
+    HHOOK hook = SetWindowsHookExW(WH_MOUSE_LL, WheelHookProc, g_self, 0);
+    MSG m;
+
+    g_wheelHooked = hook != NULL;
+    SetEvent(ready);
+    if (!hook)
+        return 0;
+    while (GetMessageW(&m, NULL, 0, 0) > 0)
+        DispatchMessageW(&m);
+    UnhookWindowsHookEx(hook);
+    return 0;
+}
+
+/* Patch the shared DirectInput device vtable via a throwaway mouse device and
+ * start the mouse hook. Called from Direct3DCreate9, once the game's own
+ * DirectInput is loaded. */
+static void InstallWheelFix(void)
+{
+    HMODULE dinput = GetModuleHandleA("dinput8.dll");
+    DirectInput8Create_t create;
+    IDirectInput8A *di = NULL;
+    IDirectInputDevice8A *mouse = NULL;
+    HANDLE ready, thread;
+
+    if (!dinput)
+        return;
+
+    ready = CreateEventW(NULL, TRUE, FALSE, NULL);
+    thread = ready ? CreateThread(NULL, 0, WheelHookThread, ready, 0, NULL) : NULL;
+    if (thread) {
+        WaitForSingleObject(ready, 5000);
+        CloseHandle(thread);
+    }
+    if (ready)
+        CloseHandle(ready);
+    if (!g_wheelHooked) {
+        Log("mouse hook failed (error %lu), wheel left alone", GetLastError());
+        return;
+    }
+
+    create = (DirectInput8Create_t)RawExport(dinput, "DirectInput8Create");
+    if (!create || FAILED(create(GetModuleHandleA(NULL), DIRECTINPUT_VERSION, &IID_IDirectInput8A, (void **)&di, NULL)))
+        return;
+    if (SUCCEEDED(di->lpVtbl->CreateDevice(di, &GUID_SysMouse, &mouse, NULL))) {
+        void **vtable = *(void ***)mouse;
+        PatchVtable(vtable, VT_DIDEV_GETDEVICESTATE, (void *)Hook_GetDeviceState, (void **)&g_realGetDeviceState);
+        PatchVtable(vtable, VT_DIDEV_GETDEVICEDATA, (void *)Hook_GetDeviceData, (void **)&g_realGetDeviceData);
+        Log("wheel fix installed");
+        mouse->lpVtbl->Release(mouse);
+    }
+    di->lpVtbl->Release(di);
+}
 
 /* ------------------------------------------------------------------------ */
 

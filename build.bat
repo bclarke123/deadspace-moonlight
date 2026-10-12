@@ -15,5 +15,5 @@ if not exist bin mkdir bin
 if not exist build mkdir build
 cl /nologo /O2 /W4 /MT /LD src\d3d9shim.c /Fobuild\ /Fdbuild\ ^
    /link /OUT:bin\d3d9.dll /IMPLIB:build\d3d9shim.lib ^
-   kernel32.lib user32.lib || exit /b 1
+   kernel32.lib user32.lib dxguid.lib || exit /b 1
 echo Built bin\d3d9.dll

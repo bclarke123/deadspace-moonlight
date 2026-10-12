@@ -1,6 +1,6 @@
 # Dead Space (2008) virtual display crash fix
 
-A drop-in `d3d9.dll` that stops the original **Dead Space (2008)** from crashing at startup on PCs whose display is a **virtual display adapter**, which is the usual setup when streaming games from a headless PC. It also caps the game at 60 fps, because without a working VSync its physics break.
+A drop-in `d3d9.dll` that stops the original **Dead Space (2008)** from crashing at startup on PCs whose display is a **virtual display adapter**, which is the usual setup when streaming games from a headless PC. It also fixes the two problems you hit next: physics breaking because VSync doesn't cap the frame rate, and menus skipping endlessly after you use the mouse wheel.
 
 ## Symptoms
 
@@ -22,13 +22,18 @@ At startup Dead Space reads the display adapter's hardware ID through `EnumDispl
 
 Dead Space's physics and scripting break at high frame rates. Kendra's hair stretches across the room, and doors stay solid after they open, so you can't walk through. The game relies on VSync to hold it at 60 fps, but VSync often has no effect on a virtual display. On the test machine the game would have run at 1,300–2,400 fps.
 
+### Menus skip endlessly after using the scroll wheel
+
+One wheel click can make the menu selection race and keep moving, and other menu input can feel "sticky". The game asks DirectInput for wheel movement since the last read, but on the test machine (with input from Sunshine/Moonlight) DirectInput returned a **running total** instead: one click up and two down read as `120, 240, 120, 0, -120 ...` rather than `+120, -120, -120`. The game treats every non-zero total as more scrolling. Free-spinning wheels (Logitech MX) make it worse, sending 40+ clicks in half a second.
+
 ## The fix
 
 This `d3d9.dll` sits in the game folder and:
 
 1. Hooks `EnumDisplayDevicesA` so that any adapter without a PCI vendor ID reports the ID of a real GPU in your system instead. It prefers a discrete NVIDIA/AMD card over Intel integrated graphics, and falls back to a dummy ID if there's no real GPU at all.
 2. Caps the frame rate at 60 fps, which keeps physics and scripting working whether or not VSync works on your display.
-3. Passes every Direct3D 9 call through to Windows' own `d3d9.dll`, unchanged.
+3. Counts mouse wheel clicks itself with a low-level mouse hook instead of trusting DirectInput's value. Only clicks made while Dead Space is the active window count. It passes them to the game one at a time, at most one every 100 ms, and drops the excess so scrolling stops when the wheel stops.
+4. Passes every Direct3D 9 call through to Windows' own `d3d9.dll`, unchanged.
 
 It doesn't modify any game files, and you can remove it at any time.
 
@@ -47,7 +52,7 @@ This replaces any other `d3d9.dll` in the game folder, such as DXVK's. DXVK isn'
 
 ### Troubleshooting
 
-Create an empty file named `d3d9shim.log` in the game folder and launch the game. The fix will write which GPU it picked, which adapters it rewrote, and the frame rate every 10 seconds for the first two minutes, alongside the frame rate the game would reach without the cap. Delete the file to turn logging off again.
+Create an empty file named `d3d9shim.log` in the game folder and launch the game. The fix will write which GPU it picked, which adapters it rewrote, the frame rate every 10 seconds for the first two minutes (alongside the frame rate the game would reach without the cap), and each wheel click it counted next to the value DirectInput reported. Delete the file to turn logging off again.
 
 ## Building
 
