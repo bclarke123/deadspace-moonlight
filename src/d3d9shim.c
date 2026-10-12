@@ -9,7 +9,8 @@
  *
  * This DLL hooks user32!EnumDisplayDevicesA and, for adapters that lack a PCI
  * vendor ID, reports the DeviceID of a real GPU in the system instead. All
- * Direct3D 9 calls are passed through to the system d3d9.dll.
+ * Direct3D 9 calls are passed through to the system d3d9.dll, and frames are
+ * capped at 60 fps because the game's physics break at higher frame rates.
  *
  * Constraints learned the hard way:
  *  - Windows applies its DXMaximizedWindowedMode compatibility shim
@@ -201,8 +202,9 @@ static void InstallDisplayHook(void)
 /* ------------------------------------------------------------------------ */
 /* d3d9 pass-through                                                         */
 
-/* Exports and their ordinals. Ordinal 17 is deliberately unused (see top). */
-#define D3D9_EXPORTS(X)                                  \
+/* Exports passed straight through, with their ordinals. Direct3DCreate9 (37)
+ * is wrapped below. Ordinal 17 is deliberately unused (see top). */
+#define D3D9_PASSTHROUGH(X)                              \
     X(Direct3DCreate9On12, 20)                           \
     X(Direct3DCreate9On12Ex, 21)                         \
     X(Direct3DShaderValidatorCreate9, 24)                \
@@ -218,20 +220,21 @@ static void InstallDisplayHook(void)
     X(DebugSetLevel, 34)                                 \
     X(DebugSetMute, 35)                                  \
     X(Direct3D9EnableMaximizedWindowedModeShim, 36)      \
-    X(Direct3DCreate9, 37)                               \
     X(Direct3DCreate9Ex, 38)
 
 enum {
 #define X(name, ord) IDX_##name,
-    D3D9_EXPORTS(X)
+    D3D9_PASSTHROUGH(X)
 #undef X
+    IDX_Direct3DCreate9,
     IDX_COUNT
 };
 
 static const char *const g_exportNames[IDX_COUNT] = {
 #define X(name, ord) #name,
-    D3D9_EXPORTS(X)
+    D3D9_PASSTHROUGH(X)
 #undef X
+    "Direct3DCreate9",
 };
 
 static void *g_real[IDX_COUNT];
@@ -271,8 +274,147 @@ static void __cdecl LoadRealD3D9(void)
         __asm jmp dword ptr [g_real + IDX_##name * 4]                           \
     }                                                                           \
     __pragma(comment(linker, "/export:" #name "=_Stub_" #name ",@" #ord))
-D3D9_EXPORTS(X)
+D3D9_PASSTHROUGH(X)
 #undef X
+
+/* ------------------------------------------------------------------------ */
+/* 60 fps frame limiter                                                      */
+/*                                                                           */
+/* Dead Space's physics and scripting break well above 60 fps: doors stay    */
+/* solid after opening, and hair and cloth stretch across rooms. The game    */
+/* relies on vsync to hold it at 60, but vsync often has no effect on        */
+/* virtual displays, so we pace IDirect3DDevice9::Present ourselves.         */
+
+#define TARGET_FPS 60
+
+/* vtable slots, from d3d9.h */
+#define VT_D3D9_CREATEDEVICE 16
+#define VT_DEVICE_PRESENT    17
+
+typedef HRESULT (WINAPI *CreateDevice_t)(void *, UINT, DWORD, HWND, DWORD, void *, void **);
+typedef HRESULT (WINAPI *Present_t)(void *, const RECT *, const RECT *, HWND, const void *);
+
+static CreateDevice_t g_realCreateDevice;
+static Present_t g_realPresent;
+static HANDLE g_timer;
+static LARGE_INTEGER g_qpcFreq, g_nextFrame, g_fpsWindowStart;
+static DWORD g_fpsFrames;
+static LONGLONG g_fpsWaited;
+static int g_fpsReports;
+
+static void PatchVtable(void **vtable, int slot, void *hook, void **original)
+{
+    DWORD old;
+    if (vtable[slot] == hook)
+        return;
+    if (!VirtualProtect(&vtable[slot], sizeof(void *), PAGE_READWRITE, &old))
+        return;
+    *original = vtable[slot];
+    vtable[slot] = hook;
+    VirtualProtect(&vtable[slot], sizeof(void *), old, &old);
+}
+
+/* Wait until the given QPC time: sleep on a high-resolution timer for most of
+ * it, then spin for the last ~1.5 ms for accuracy. */
+static void WaitUntil(LONGLONG target)
+{
+    LARGE_INTEGER now, due;
+    LONGLONG spinTicks = g_qpcFreq.QuadPart * 3 / 2000;
+    LONGLONG remaining;
+
+    QueryPerformanceCounter(&now);
+    remaining = target - now.QuadPart - spinTicks;
+    if (remaining > 0) {
+        /* Negative due time = relative, in 100 ns units. */
+        due.QuadPart = -(remaining * 10000000 / g_qpcFreq.QuadPart);
+        if (g_timer && SetWaitableTimer(g_timer, &due, 0, NULL, NULL, FALSE))
+            WaitForSingleObject(g_timer, INFINITE);
+        else
+            Sleep((DWORD)(remaining * 1000 / g_qpcFreq.QuadPart));
+    }
+    do {
+        YieldProcessor();
+        QueryPerformanceCounter(&now);
+    } while (now.QuadPart < target);
+}
+
+static void LogFps(void)
+{
+    LARGE_INTEGER now;
+    LONGLONG elapsed;
+
+    QueryPerformanceCounter(&now);
+    g_fpsFrames++;
+    elapsed = now.QuadPart - g_fpsWindowStart.QuadPart;
+    if (elapsed < g_qpcFreq.QuadPart * 10)
+        return;
+    /* A dozen reports (two minutes) is enough to confirm the cap. */
+    if (g_fpsReports < 12) {
+        g_fpsReports++;
+        /* Time not spent waiting shows how fast the game would run uncapped. */
+        Log("fps: %lu (uncapped would be ~%lu)", (DWORD)(g_fpsFrames * g_qpcFreq.QuadPart / elapsed),
+            elapsed > g_fpsWaited ? (DWORD)(g_fpsFrames * g_qpcFreq.QuadPart / (elapsed - g_fpsWaited)) : 0);
+    }
+    g_fpsWindowStart = now;
+    g_fpsFrames = 0;
+    g_fpsWaited = 0;
+}
+
+static HRESULT WINAPI Hook_Present(void *device, const RECT *src, const RECT *dst, HWND wnd, const void *dirty)
+{
+    LONGLONG period = g_qpcFreq.QuadPart / TARGET_FPS;
+    LARGE_INTEGER now;
+
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart < g_nextFrame.QuadPart) {
+        WaitUntil(g_nextFrame.QuadPart);
+        g_fpsWaited += g_nextFrame.QuadPart - now.QuadPart;
+        g_nextFrame.QuadPart += period;
+    } else if (now.QuadPart - g_nextFrame.QuadPart > period) {
+        /* Fell behind (loading screen, alt-tab): restart pacing from now
+         * instead of rushing frames out to catch up. */
+        g_nextFrame.QuadPart = now.QuadPart + period;
+    } else {
+        g_nextFrame.QuadPart += period;
+    }
+    if (g_logEnabled)
+        LogFps();
+    return g_realPresent(device, src, dst, wnd, dirty);
+}
+
+static HRESULT WINAPI Hook_CreateDevice(void *d3d, UINT adapter, DWORD type, HWND wnd, DWORD flags,
+                                        void *params, void **device)
+{
+    HRESULT hr = g_realCreateDevice(d3d, adapter, type, wnd, flags, params, device);
+    if (SUCCEEDED(hr) && device && *device) {
+        PatchVtable(*(void ***)*device, VT_DEVICE_PRESENT, (void *)Hook_Present, (void **)&g_realPresent);
+        Log("device created, frame limiter at %lu fps", (DWORD)TARGET_FPS);
+    }
+    return hr;
+}
+
+void *WINAPI My_Direct3DCreate9(UINT sdkVersion)
+{
+    typedef void *(WINAPI *Direct3DCreate9_t)(UINT);
+    void *d3d;
+
+    LoadRealD3D9();
+    if (!g_real[IDX_Direct3DCreate9])
+        return NULL;
+    d3d = ((Direct3DCreate9_t)g_real[IDX_Direct3DCreate9])(sdkVersion);
+    if (d3d) {
+        if (!g_qpcFreq.QuadPart) {
+            QueryPerformanceFrequency(&g_qpcFreq);
+            g_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if (!g_timer) /* High-resolution timers need Windows 10 1803+. */
+                g_timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+            QueryPerformanceCounter(&g_fpsWindowStart);
+        }
+        PatchVtable(*(void ***)d3d, VT_D3D9_CREATEDEVICE, (void *)Hook_CreateDevice, (void **)&g_realCreateDevice);
+    }
+    return d3d;
+}
+#pragma comment(linker, "/export:Direct3DCreate9=_My_Direct3DCreate9@4,@37")
 
 /* ------------------------------------------------------------------------ */
 

@@ -1,6 +1,6 @@
 # Dead Space (2008) virtual display crash fix
 
-A drop-in `d3d9.dll` that stops the original **Dead Space (2008)** from crashing at startup on PCs whose display is a **virtual display adapter**, which is the usual setup when streaming games from a headless PC.
+A drop-in `d3d9.dll` that stops the original **Dead Space (2008)** from crashing at startup on PCs whose display is a **virtual display adapter**, which is the usual setup when streaming games from a headless PC. It also caps the game at 60 fps, because without a working VSync its physics break.
 
 ## Symptoms
 
@@ -18,12 +18,17 @@ A drop-in `d3d9.dll` that stops the original **Dead Space (2008)** from crashing
 
 At startup Dead Space reads the display adapter's hardware ID through `EnumDisplayDevicesA` and parses it as `PCI\VEN_xxxx&DEV_xxxx&...` to detect the GPU vendor. Virtual adapters report IDs like `root\iddsampledriver` or `Root\Parsec\VDA` with no `VEN_` in them. The game's lookup returns NULL, it reads from address `0x4`, and it crashes.
 
+### Broken physics once it runs
+
+Dead Space's physics and scripting break at high frame rates. Kendra's hair stretches across the room, and doors stay solid after they open, so you can't walk through. The game relies on VSync to hold it at 60 fps, but VSync often has no effect on a virtual display. On the test machine the game would have run at 1,300–2,400 fps.
+
 ## The fix
 
 This `d3d9.dll` sits in the game folder and:
 
 1. Hooks `EnumDisplayDevicesA` so that any adapter without a PCI vendor ID reports the ID of a real GPU in your system instead. It prefers a discrete NVIDIA/AMD card over Intel integrated graphics, and falls back to a dummy ID if there's no real GPU at all.
-2. Passes every Direct3D 9 call through to Windows' own `d3d9.dll`, unchanged.
+2. Caps the frame rate at 60 fps, which keeps physics and scripting working whether or not VSync works on your display.
+3. Passes every Direct3D 9 call through to Windows' own `d3d9.dll`, unchanged.
 
 It doesn't modify any game files, and you can remove it at any time.
 
@@ -42,7 +47,7 @@ This replaces any other `d3d9.dll` in the game folder, such as DXVK's. DXVK isn'
 
 ### Troubleshooting
 
-Create an empty file named `d3d9shim.log` in the game folder and launch the game. The fix will write which GPU it picked and which adapters it rewrote. Delete the file to turn logging off again.
+Create an empty file named `d3d9shim.log` in the game folder and launch the game. The fix will write which GPU it picked, which adapters it rewrote, and the frame rate every 10 seconds for the first two minutes, alongside the frame rate the game would reach without the cap. Delete the file to turn logging off again.
 
 ## Building
 
