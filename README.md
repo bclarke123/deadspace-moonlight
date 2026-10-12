@@ -54,6 +54,8 @@ build.bat
 
 The output is `bin\d3d9.dll`, a 32-bit DLL that statically links the C runtime, so it needs no redistributables.
 
+Pushing a tag that starts with `v` (for example `v1.0.0`) builds the DLL on GitHub Actions and publishes it as a GitHub Release.
+
 ## Technical notes
 
 Windows applies its own compatibility shim to `Dead Space.exe` (`DXMaximizedWindowedMode` in `AcLayers.dll`, the "fullscreen optimizations" machinery). That shim imposes some constraints on any proxy `d3d9.dll`:
